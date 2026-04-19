@@ -537,3 +537,127 @@ Skip these unless you have a specific reason, they're overkill for a personal bo
 - A reverse proxy (nginx/Caddy) in front of the dashboard (Tailscale HTTPS handles this)
 - Running the bot inside Docker on top of the VM (adds complexity with no meaningful isolation gain over the systemd unit)
 - Full-disk encryption on a homelab VM whose disk never leaves your house (useful on a laptop, paranoid here)
+
+---
+
+## Publishing the dashboard at claudeclaw.henryhomelab.dev (Caddy + Cloudflare wildcard)
+
+This section assumes you already have:
+
+- A wildcard `*.henryhomelab.dev` DNS record at Cloudflare (proxied or DNS-only, either works).
+- A **Caddy reverse proxy VM** elsewhere on the Proxmox host, already terminating TLS for your other services on `*.henryhomelab.dev`.
+
+Because you have a wildcard, **you do not need to add a new DNS record**. `claudeclaw.henryhomelab.dev` already resolves. All the work is:
+
+1. Tell the ClaudeClaw VM to trust the Caddy VM through the firewall.
+2. Add a site block to Caddy.
+3. Tell ClaudeClaw what its public URL is so Telegram `/dashboard` links use it.
+
+### Step 1: Find the IPs you need
+
+On the ClaudeClaw VM:
+
+```bash
+ip -4 addr show | grep inet
+```
+
+Note its LAN IP (e.g. `192.168.1.42`). Do the same on the Caddy VM (e.g. `192.168.1.10`). The rest of this section uses those placeholders.
+
+### Step 2: Open the firewall to the Caddy VM only
+
+Back in the hardening section you set ufw to `default deny incoming` and only allowed `tailscale0`. Caddy isn't on the tailnet, so you need to poke a single, scoped hole:
+
+```bash
+# On the ClaudeClaw VM
+sudo ufw allow from 192.168.1.10 to any port 3141 proto tcp comment 'caddy reverse proxy'
+sudo ufw status verbose
+```
+
+Use the Caddy VM's IP, not the whole subnet. Only that one host needs to reach port 3141.
+
+### Step 3: Add the site block to the Caddyfile
+
+SSH into the Caddy VM and edit `/etc/caddy/Caddyfile`:
+
+```caddy
+claudeclaw.henryhomelab.dev {
+    encode zstd gzip
+
+    # The dashboard talks SSE (live chat streaming) and WebSockets
+    # (/ws/warroom). Caddy handles both with no extra config, but do
+    # not add any buffering directives in front of this block.
+    reverse_proxy 192.168.1.42:3141 {
+        # Pass the original host + client IP through so the dashboard
+        # logs the right address instead of always seeing the Caddy VM.
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # Reasonable timeouts. SSE streams are long lived.
+        transport http {
+            read_timeout 600s
+            write_timeout 600s
+        }
+    }
+}
+```
+
+Validate and reload:
+
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+If your Cloudflare record is **proxied (orange cloud)**, set your SSL mode in Cloudflare to **Full (strict)** and use Caddy's automatic HTTPS as above. Caddy will grab a real Let's Encrypt cert via HTTP-01, and Cloudflare will re-encrypt on the edge. If you hit HTTP-01 challenge issues because of the proxy, either switch the record to DNS-only during issuance or configure Caddy's [Cloudflare DNS plugin](https://github.com/caddy-dns/cloudflare) for DNS-01 and use a scoped Cloudflare API token.
+
+### Step 4: Tell ClaudeClaw its public URL
+
+On the ClaudeClaw VM, edit `~/claudeclaw-os/.env` and set:
+
+```
+DASHBOARD_URL=https://claudeclaw.henryhomelab.dev
+```
+
+Restart the service so the bot picks it up:
+
+```bash
+systemctl --user restart claudeclaw
+```
+
+Now when you send `/dashboard` in Telegram, the link comes back as `https://claudeclaw.henryhomelab.dev/?token=...&chatId=...` instead of a raw IP.
+
+### Step 5: Test it
+
+From anywhere on the internet:
+
+```bash
+curl -sI https://claudeclaw.henryhomelab.dev | head -5
+```
+
+You should see `HTTP/2 200` (or 401 if you hit `/` without a token, which is also fine — it means TLS, Caddy, and the upstream are all working). Then open the URL from `/dashboard` in Telegram on your phone. Live chat, SSE streaming, and the War Room WebSocket should all work.
+
+### Step 6 (recommended): Add Cloudflare Access in front of it
+
+The dashboard's own auth is just `?token=...` in the query string. That's fine, but URLs with tokens end up in browser history, clipboard managers, and server logs. Since you're already on Cloudflare, put Zero Trust Access in front of the hostname and require a real login before anyone reaches Caddy at all:
+
+1. Go to [one.dash.cloudflare.com](https://one.dash.cloudflare.com) → **Access** → **Applications** → **Add an application** → **Self-hosted**.
+2. Application domain: `claudeclaw.henryhomelab.dev`.
+3. Identity: Google, GitHub, or one-time PIN to your email.
+4. Policy: allow only your email address.
+
+Now every request to `claudeclaw.henryhomelab.dev` hits a Cloudflare login first. The `DASHBOARD_TOKEN` in the URL becomes a second factor rather than the only gate. Bonus: Cloudflare Access gives you an audit log of every time the dashboard was opened.
+
+If you do this, also set the Caddy block to only accept connections from Cloudflare's IP ranges so nobody can bypass Access by hitting Caddy directly over its IP. The maintained list is at [cloudflare.com/ips](https://www.cloudflare.com/ips/); add them as `remote_ip` matchers on the site block, or firewall them at the router.
+
+### Step 7: You can now turn off the LAN SSH fallback
+
+Earlier in the hardening section you left a `sudo ufw allow from 192.168.0.0/16 to any port 22 proto tcp` rule as a safety net. If Tailscale SSH has been working for a while and the dashboard is now reachable publicly, you don't need that fallback anymore:
+
+```bash
+sudo ufw status numbered
+sudo ufw delete <rule-number-for-port-22>
+```
+
+---
