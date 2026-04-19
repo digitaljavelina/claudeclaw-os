@@ -345,3 +345,195 @@ Keep the macmini if **any** of these are true for you:
 - Your workflow depends on Apple Shortcuts.
 
 Otherwise, a Linux VM on Proxmox with Tailscale is the stronger long-term home for a 24/7 assistant.
+
+---
+
+## Hardening the VM (on top of Tailscale)
+
+Tailscale already takes you out of the public internet, which is 80% of the battle. These steps tighten up the remaining 20%. Do them in order.
+
+### 1. Lock the firewall to the tailnet
+
+Even on a home LAN, the VM shouldn't be answering random probes from IoT devices, roommates, or a compromised machine on the same subnet. Drop everything that isn't Tailscale:
+
+```bash
+sudo apt install -y ufw
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+# Allow traffic from the Tailscale interface only
+sudo ufw allow in on tailscale0
+
+# Keep a LAN fallback for SSH in case Tailscale breaks
+# (remove this line later once you're confident)
+sudo ufw allow from 192.168.0.0/16 to any port 22 proto tcp
+
+sudo ufw enable
+sudo ufw status verbose
+```
+
+Now the dashboard on port 3141 is only reachable over the tailnet, even though the app still binds to `0.0.0.0` internally. If you want belt-and-braces, you can also set `DASHBOARD_HOST` if your version exposes it, but the firewall rule above is enough.
+
+### 2. SSH: keys only, no passwords, no root
+
+Generate an SSH key on your laptop (if you don't already have one), copy it up, then lock down sshd:
+
+```bash
+# On your laptop
+ssh-copy-id claudeclaw@<VM-IP>
+
+# On the VM
+sudo nano /etc/ssh/sshd_config.d/99-hardening.conf
+```
+
+Paste:
+
+```
+PasswordAuthentication no
+PermitRootLogin no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+```
+
+Save, then:
+
+```bash
+sudo systemctl restart ssh
+```
+
+**Better still: turn on Tailscale SSH and disable the normal sshd entirely.** That way even a stolen key doesn't get anyone in unless they're on your tailnet:
+
+```bash
+sudo tailscale up --ssh
+sudo systemctl disable --now ssh
+```
+
+You now SSH in with `ssh claudeclaw@claudeclaw` (Tailscale MagicDNS) and auth happens through your Tailscale identity.
+
+### 3. Automatic security updates
+
+Unattended upgrades patch CVEs without you thinking about it:
+
+```bash
+sudo apt install -y unattended-upgrades
+sudo dpkg-reconfigure --priority=low unattended-upgrades
+```
+
+Answer "Yes" when it asks. Then verify it's running:
+
+```bash
+sudo systemctl status unattended-upgrades
+```
+
+Reboots after kernel updates are still manual — schedule a monthly `sudo reboot` or install `needrestart` and let it tell you when one's needed.
+
+### 4. Lock down `.env` (it's full of secrets)
+
+The `.env` file has your Telegram token, `DASHBOARD_TOKEN`, `DB_ENCRYPTION_KEY`, and every API key you added. Anyone who reads it owns your bot:
+
+```bash
+chmod 600 ~/claudeclaw-os/.env
+ls -la ~/claudeclaw-os/.env    # should show -rw------- claudeclaw claudeclaw
+```
+
+While you're at it, make sure the SQLite DB isn't world-readable either:
+
+```bash
+chmod 700 ~/claudeclaw-os/store
+chmod 600 ~/claudeclaw-os/store/claudeclaw.db
+```
+
+### 5. Harden the systemd service
+
+Edit the unit the setup wizard dropped at `~/.config/systemd/user/claudeclaw.service` and add these lines inside the `[Service]` block, above `[Install]`:
+
+```ini
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/claudeclaw-os %h/.claude %h/.config/claudeclaw
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+```
+
+Then reload and restart:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart claudeclaw
+systemctl --user status claudeclaw
+```
+
+If the bot fails to start, it usually means one of your skills writes to a path outside `ReadWritePaths` — add the offending path and retry. Don't just remove the hardening.
+
+### 6. Turn on ClaudeClaw's own security features
+
+This is the layer that protects you if an attacker gets as far as Telegram itself. In your `.env` (the setup wizard prompts for these, but double check):
+
+```
+SECURITY_PIN=1234                  # required before the bot will act
+SECURITY_IDLE_LOCK_MINUTES=15      # auto-lock after inactivity
+SECURITY_KILL_PHRASE=howlongdoyougot   # one-shot panic nuke
+```
+
+Send `/status` in Telegram to verify PIN and idle-lock are active. Rotate `DASHBOARD_TOKEN` and `SECURITY_PIN` every few months by regenerating and restarting the service.
+
+### 7. Back up the SQLite database
+
+Snapshots protect you from "I broke the VM." They don't help if `claudeclaw.db` corrupts or a skill deletes something. Add a nightly dump to a different disk (or to your NAS over Tailscale):
+
+```bash
+mkdir -p ~/backups
+cat > ~/backup-claudeclaw.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+STAMP=$(date +%Y%m%d-%H%M)
+DEST="$HOME/backups/claudeclaw-$STAMP.db"
+sqlite3 "$HOME/claudeclaw-os/store/claudeclaw.db" ".backup '$DEST'"
+gzip -f "$DEST"
+# Keep 14 days
+find "$HOME/backups" -name 'claudeclaw-*.db.gz' -mtime +14 -delete
+EOF
+chmod +x ~/backup-claudeclaw.sh
+
+# Run it nightly at 03:30
+(crontab -l 2>/dev/null; echo "30 3 * * * $HOME/backup-claudeclaw.sh") | crontab -
+```
+
+`sqlite3 .backup` is safe to run while the bot is live. A plain `cp` of the DB file isn't.
+
+### 8. Keep Node and npm dependencies patched
+
+Every few weeks:
+
+```bash
+cd ~/claudeclaw-os
+npm audit
+npm outdated
+```
+
+Actually act on the output. `npm audit fix` usually works; anything that requires a major version bump, read the changelog first.
+
+### 9. Don't run as root, don't `sudo npm install -g` your bot
+
+You're already fine here if you followed the guide — ClaudeClaw runs as your regular user via a user systemd unit. If you ever feel tempted to "just use root to make the permissions work", stop and fix the permissions instead.
+
+### 10. Monitor what the bot is doing
+
+`journalctl --user -u claudeclaw -f` is your friend. Set up a log alert (even just a cron that greps for `error` and pushes a Telegram message via the notify script) so you notice crash loops, rate limits, or API key failures within minutes instead of days.
+
+---
+
+### What you should *not* bother with on a homelab VM
+
+Skip these unless you have a specific reason, they're overkill for a personal bot:
+
+- SELinux / AppArmor custom profiles (the systemd hardening above is enough)
+- Fail2ban (you disabled password SSH and firewalled to tailnet, there's nothing to ban)
+- A reverse proxy (nginx/Caddy) in front of the dashboard (Tailscale HTTPS handles this)
+- Running the bot inside Docker on top of the VM (adds complexity with no meaningful isolation gain over the systemd unit)
+- Full-disk encryption on a homelab VM whose disk never leaves your house (useful on a laptop, paranoid here)
