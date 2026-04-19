@@ -285,3 +285,63 @@ The `token=` value in the URL doesn't match `DASHBOARD_TOKEN` in `.env`. Copy it
 
 **VM runs out of disk after a few months.**
 SQLite memory plus Telegram media uploads grow over time. Either resize the VM disk in Proxmox (Hardware → Hard Disk → Resize disk, then `sudo growpart` + `sudo resize2fs` inside the VM), or periodically clear `~/claudeclaw-os/workspace/uploads/`.
+
+---
+
+## Linux VM (homelab + Tailscale) vs macmini: what changes
+
+ClaudeClaw runs on either one, but the two environments have different strengths. Read this before you pick so you're not surprised later.
+
+### Things a Linux VM does *better* than a macmini
+
+| Area | Why the VM wins |
+|------|-----------------|
+| **Always-on reliability** | No display sleep, no "Mac woke up to install updates", no Spotlight hammering the disk. systemd + `enable-linger` is rock solid. |
+| **Snapshots and rollback** | Proxmox snapshots take seconds. On a macmini you're stuck with Time Machine or manual backups. |
+| **Resource isolation** | The bot can't steal CPU from your day-to-day work, because there is no day-to-day work on it. |
+| **Reproducibility** | Rebuild the whole thing from the ISO in 20 minutes. A macmini's config drifts over the years. |
+| **Cost** | A VM is free if you already have a Proxmox box. A macmini is $600+. |
+| **Remote access via Tailscale** | Install Tailscale on the VM (`curl -fsSL https://tailscale.com/install.sh \| sh && sudo tailscale up`) and the dashboard becomes reachable from any of your devices at `http://claudeclaw:3141/...` with zero port forwarding, zero Cloudflare tunnel, zero public exposure. |
+| **MagicDNS + HTTPS** | Turn on MagicDNS and HTTPS certs in the Tailscale admin panel and you can skip the whole `DASHBOARD_URL` + Cloudflared flow entirely. The dashboard just works over the tailnet. |
+| **Headless by design** | No keyboard, no monitor, no one logs in and accidentally closes the terminal window. |
+| **Multi-agent scaling** | Want five specialist agents? Bump the VM from 2 → 4 cores in Proxmox. On a macmini you're capped at whatever you bought. |
+
+### Things a macmini does that a Linux VM *cannot* (or can only fake)
+
+These are the genuine functional gaps. If any of these matter to you, either keep the macmini or set up a hybrid (bot on Linux, macOS-only skills triggered from a laptop).
+
+| Capability | Status on Linux VM | Workaround |
+|------------|--------------------|-----------|
+| **macOS `say` TTS fallback** | Not available | Use ElevenLabs or Gradium for voice output. There is no free local fallback on Linux. |
+| **Apple Messages / iMessage** | Not available | None. iMessage requires a real Apple device. |
+| **Apple Notes, Apple Mail, Apple Calendar, Reminders** | Not available | Use the bundled Gmail and Google Calendar skills, or the Google Workspace CLI. |
+| **Apple Shortcuts** | Not available | Write plain shell scripts or Claude skills. |
+| **macOS Keychain access** | Not available | Store secrets in `.env` (already how ClaudeClaw does it). |
+| **AppleScript / JXA automation** | Not available | None for macOS apps. For cross-platform tasks, use the `agent-browser` skill. |
+| **Xcode, iOS builds, iOS simulator** | Not available | None. You need a Mac for any Apple-platform build. |
+| **macOS `open` command, Spotlight, Finder tags** | Not available | Use `xdg-open` and regular `find` / `locate`. |
+| **Touch ID / Apple Pay prompts** | Not available | None. |
+| **launchd agents** | Not applicable | Use the systemd user service installed by the setup wizard (covered in Step 10). |
+| **Local ML accelerated by Metal / Apple Neural Engine** | Not available (unless the VM has a GPU passed through) | Use cloud APIs (Groq for Whisper, Gemini for video) or pass a GPU to the VM. |
+| **"Continuity" with iPhone/iPad** (AirDrop, Handoff, SMS relay) | Not available | None. |
+
+### The practical shape of a Tailscale-based homelab deployment
+
+If you're going the Linux-in-Proxmox route, here's the setup that pays off the most:
+
+1. **Tailscale on the VM** for SSH and dashboard access from anywhere. Set a hostname like `claudeclaw` in Tailscale → MagicDNS gives you `http://claudeclaw:3141/...` from any device in your tailnet.
+2. **Tailscale on your phone** so `/dashboard` links open natively over the VPN with no Cloudflare tunnel.
+3. **Tailscale SSH** (`sudo tailscale up --ssh`) so you stop managing SSH keys and use Tailscale ACLs instead.
+4. **Tailscale ACLs** if you want to share the dashboard with a partner or teammate, scoped to their device only.
+5. **Proxmox backups** to a NAS or external drive on top of snapshots, so a dead Proxmox host isn't a data-loss event.
+
+### When to keep the macmini
+
+Keep the macmini if **any** of these are true for you:
+
+- You rely on iMessage, Apple Notes, Apple Mail, or Reminders as part of your daily flow and want ClaudeClaw to read/write them.
+- You're building iOS or macOS apps and want Claude to run `xcodebuild`.
+- You use the macOS `say` local TTS fallback and don't want to pay ElevenLabs or register for Gradium.
+- Your workflow depends on Apple Shortcuts.
+
+Otherwise, a Linux VM on Proxmox with Tailscale is the stronger long-term home for a 24/7 assistant.
