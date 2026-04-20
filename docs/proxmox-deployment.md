@@ -285,3 +285,379 @@ The `token=` value in the URL doesn't match `DASHBOARD_TOKEN` in `.env`. Copy it
 
 **VM runs out of disk after a few months.**
 SQLite memory plus Telegram media uploads grow over time. Either resize the VM disk in Proxmox (Hardware → Hard Disk → Resize disk, then `sudo growpart` + `sudo resize2fs` inside the VM), or periodically clear `~/claudeclaw-os/workspace/uploads/`.
+
+---
+
+## Linux VM (homelab + Tailscale) vs macmini: what changes
+
+ClaudeClaw runs on either one, but the two environments have different strengths. Read this before you pick so you're not surprised later.
+
+### Things a Linux VM does *better* than a macmini
+
+| Area | Why the VM wins |
+|------|-----------------|
+| **Always-on reliability** | No display sleep, no "Mac woke up to install updates", no Spotlight hammering the disk. systemd + `enable-linger` is rock solid. |
+| **Snapshots and rollback** | Proxmox snapshots take seconds. On a macmini you're stuck with Time Machine or manual backups. |
+| **Resource isolation** | The bot can't steal CPU from your day-to-day work, because there is no day-to-day work on it. |
+| **Reproducibility** | Rebuild the whole thing from the ISO in 20 minutes. A macmini's config drifts over the years. |
+| **Cost** | A VM is free if you already have a Proxmox box. A macmini is $600+. |
+| **Remote access via Tailscale** | Install Tailscale on the VM (`curl -fsSL https://tailscale.com/install.sh \| sh && sudo tailscale up`) and the dashboard becomes reachable from any of your devices at `http://claudeclaw:3141/...` with zero port forwarding, zero Cloudflare tunnel, zero public exposure. |
+| **MagicDNS + HTTPS** | Turn on MagicDNS and HTTPS certs in the Tailscale admin panel and you can skip the whole `DASHBOARD_URL` + Cloudflared flow entirely. The dashboard just works over the tailnet. |
+| **Headless by design** | No keyboard, no monitor, no one logs in and accidentally closes the terminal window. |
+| **Multi-agent scaling** | Want five specialist agents? Bump the VM from 2 → 4 cores in Proxmox. On a macmini you're capped at whatever you bought. |
+
+### Things a macmini does that a Linux VM *cannot* (or can only fake)
+
+These are the genuine functional gaps. If any of these matter to you, either keep the macmini or set up a hybrid (bot on Linux, macOS-only skills triggered from a laptop).
+
+| Capability | Status on Linux VM | Workaround |
+|------------|--------------------|-----------|
+| **macOS `say` TTS fallback** | Not available | Use ElevenLabs or Gradium for voice output. There is no free local fallback on Linux. |
+| **Apple Messages / iMessage** | Not available | None. iMessage requires a real Apple device. |
+| **Apple Notes, Apple Mail, Apple Calendar, Reminders** | Not available | Use the bundled Gmail and Google Calendar skills, or the Google Workspace CLI. |
+| **Apple Shortcuts** | Not available | Write plain shell scripts or Claude skills. |
+| **macOS Keychain access** | Not available | Store secrets in `.env` (already how ClaudeClaw does it). |
+| **AppleScript / JXA automation** | Not available | None for macOS apps. For cross-platform tasks, use the `agent-browser` skill. |
+| **Xcode, iOS builds, iOS simulator** | Not available | None. You need a Mac for any Apple-platform build. |
+| **macOS `open` command, Spotlight, Finder tags** | Not available | Use `xdg-open` and regular `find` / `locate`. |
+| **Touch ID / Apple Pay prompts** | Not available | None. |
+| **launchd agents** | Not applicable | Use the systemd user service installed by the setup wizard (covered in Step 10). |
+| **Local ML accelerated by Metal / Apple Neural Engine** | Not available (unless the VM has a GPU passed through) | Use cloud APIs (Groq for Whisper, Gemini for video) or pass a GPU to the VM. |
+| **"Continuity" with iPhone/iPad** (AirDrop, Handoff, SMS relay) | Not available | None. |
+
+### The practical shape of a Tailscale-based homelab deployment
+
+If you're going the Linux-in-Proxmox route, here's the setup that pays off the most:
+
+1. **Tailscale on the VM** for SSH and dashboard access from anywhere. Set a hostname like `claudeclaw` in Tailscale → MagicDNS gives you `http://claudeclaw:3141/...` from any device in your tailnet.
+2. **Tailscale on your phone** so `/dashboard` links open natively over the VPN with no Cloudflare tunnel.
+3. **Tailscale SSH** (`sudo tailscale up --ssh`) so you stop managing SSH keys and use Tailscale ACLs instead.
+4. **Tailscale ACLs** if you want to share the dashboard with a partner or teammate, scoped to their device only.
+5. **Proxmox backups** to a NAS or external drive on top of snapshots, so a dead Proxmox host isn't a data-loss event.
+
+### When to keep the macmini
+
+Keep the macmini if **any** of these are true for you:
+
+- You rely on iMessage, Apple Notes, Apple Mail, or Reminders as part of your daily flow and want ClaudeClaw to read/write them.
+- You're building iOS or macOS apps and want Claude to run `xcodebuild`.
+- You use the macOS `say` local TTS fallback and don't want to pay ElevenLabs or register for Gradium.
+- Your workflow depends on Apple Shortcuts.
+
+Otherwise, a Linux VM on Proxmox with Tailscale is the stronger long-term home for a 24/7 assistant.
+
+---
+
+## Hardening the VM (on top of Tailscale)
+
+Tailscale already takes you out of the public internet, which is 80% of the battle. These steps tighten up the remaining 20%. Do them in order.
+
+### 1. Lock the firewall to the tailnet
+
+Even on a home LAN, the VM shouldn't be answering random probes from IoT devices, roommates, or a compromised machine on the same subnet. Drop everything that isn't Tailscale:
+
+```bash
+sudo apt install -y ufw
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+
+# Allow traffic from the Tailscale interface only
+sudo ufw allow in on tailscale0
+
+# Keep a LAN fallback for SSH in case Tailscale breaks
+# (remove this line later once you're confident)
+sudo ufw allow from 192.168.0.0/16 to any port 22 proto tcp
+
+sudo ufw enable
+sudo ufw status verbose
+```
+
+Now the dashboard on port 3141 is only reachable over the tailnet, even though the app still binds to `0.0.0.0` internally. If you want belt-and-braces, you can also set `DASHBOARD_HOST` if your version exposes it, but the firewall rule above is enough.
+
+### 2. SSH: keys only, no passwords, no root
+
+Generate an SSH key on your laptop (if you don't already have one), copy it up, then lock down sshd:
+
+```bash
+# On your laptop
+ssh-copy-id claudeclaw@<VM-IP>
+
+# On the VM
+sudo nano /etc/ssh/sshd_config.d/99-hardening.conf
+```
+
+Paste:
+
+```
+PasswordAuthentication no
+PermitRootLogin no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+```
+
+Save, then:
+
+```bash
+sudo systemctl restart ssh
+```
+
+**Better still: turn on Tailscale SSH and disable the normal sshd entirely.** That way even a stolen key doesn't get anyone in unless they're on your tailnet:
+
+```bash
+sudo tailscale up --ssh
+sudo systemctl disable --now ssh
+```
+
+You now SSH in with `ssh claudeclaw@claudeclaw` (Tailscale MagicDNS) and auth happens through your Tailscale identity.
+
+### 3. Automatic security updates
+
+Unattended upgrades patch CVEs without you thinking about it:
+
+```bash
+sudo apt install -y unattended-upgrades
+sudo dpkg-reconfigure --priority=low unattended-upgrades
+```
+
+Answer "Yes" when it asks. Then verify it's running:
+
+```bash
+sudo systemctl status unattended-upgrades
+```
+
+Reboots after kernel updates are still manual — schedule a monthly `sudo reboot` or install `needrestart` and let it tell you when one's needed.
+
+### 4. Lock down `.env` (it's full of secrets)
+
+The `.env` file has your Telegram token, `DASHBOARD_TOKEN`, `DB_ENCRYPTION_KEY`, and every API key you added. Anyone who reads it owns your bot:
+
+```bash
+chmod 600 ~/claudeclaw-os/.env
+ls -la ~/claudeclaw-os/.env    # should show -rw------- claudeclaw claudeclaw
+```
+
+While you're at it, make sure the SQLite DB isn't world-readable either:
+
+```bash
+chmod 700 ~/claudeclaw-os/store
+chmod 600 ~/claudeclaw-os/store/claudeclaw.db
+```
+
+### 5. Harden the systemd service
+
+Edit the unit the setup wizard dropped at `~/.config/systemd/user/claudeclaw.service` and add these lines inside the `[Service]` block, above `[Install]`:
+
+```ini
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/claudeclaw-os %h/.claude %h/.config/claudeclaw
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+```
+
+Then reload and restart:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user restart claudeclaw
+systemctl --user status claudeclaw
+```
+
+If the bot fails to start, it usually means one of your skills writes to a path outside `ReadWritePaths` — add the offending path and retry. Don't just remove the hardening.
+
+### 6. Turn on ClaudeClaw's own security features
+
+This is the layer that protects you if an attacker gets as far as Telegram itself. In your `.env` (the setup wizard prompts for these, but double check):
+
+```
+SECURITY_PIN=1234                  # required before the bot will act
+SECURITY_IDLE_LOCK_MINUTES=15      # auto-lock after inactivity
+SECURITY_KILL_PHRASE=howlongdoyougot   # one-shot panic nuke
+```
+
+Send `/status` in Telegram to verify PIN and idle-lock are active. Rotate `DASHBOARD_TOKEN` and `SECURITY_PIN` every few months by regenerating and restarting the service.
+
+### 7. Back up the SQLite database
+
+Snapshots protect you from "I broke the VM." They don't help if `claudeclaw.db` corrupts or a skill deletes something. Add a nightly dump to a different disk (or to your NAS over Tailscale):
+
+```bash
+mkdir -p ~/backups
+cat > ~/backup-claudeclaw.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+STAMP=$(date +%Y%m%d-%H%M)
+DEST="$HOME/backups/claudeclaw-$STAMP.db"
+sqlite3 "$HOME/claudeclaw-os/store/claudeclaw.db" ".backup '$DEST'"
+gzip -f "$DEST"
+# Keep 14 days
+find "$HOME/backups" -name 'claudeclaw-*.db.gz' -mtime +14 -delete
+EOF
+chmod +x ~/backup-claudeclaw.sh
+
+# Run it nightly at 03:30
+(crontab -l 2>/dev/null; echo "30 3 * * * $HOME/backup-claudeclaw.sh") | crontab -
+```
+
+`sqlite3 .backup` is safe to run while the bot is live. A plain `cp` of the DB file isn't.
+
+### 8. Keep Node and npm dependencies patched
+
+Every few weeks:
+
+```bash
+cd ~/claudeclaw-os
+npm audit
+npm outdated
+```
+
+Actually act on the output. `npm audit fix` usually works; anything that requires a major version bump, read the changelog first.
+
+### 9. Don't run as root, don't `sudo npm install -g` your bot
+
+You're already fine here if you followed the guide — ClaudeClaw runs as your regular user via a user systemd unit. If you ever feel tempted to "just use root to make the permissions work", stop and fix the permissions instead.
+
+### 10. Monitor what the bot is doing
+
+`journalctl --user -u claudeclaw -f` is your friend. Set up a log alert (even just a cron that greps for `error` and pushes a Telegram message via the notify script) so you notice crash loops, rate limits, or API key failures within minutes instead of days.
+
+---
+
+### What you should *not* bother with on a homelab VM
+
+Skip these unless you have a specific reason, they're overkill for a personal bot:
+
+- SELinux / AppArmor custom profiles (the systemd hardening above is enough)
+- Fail2ban (you disabled password SSH and firewalled to tailnet, there's nothing to ban)
+- A reverse proxy (nginx/Caddy) in front of the dashboard (Tailscale HTTPS handles this)
+- Running the bot inside Docker on top of the VM (adds complexity with no meaningful isolation gain over the systemd unit)
+- Full-disk encryption on a homelab VM whose disk never leaves your house (useful on a laptop, paranoid here)
+
+---
+
+## Publishing the dashboard at claudeclaw.henryhomelab.dev (Caddy + Cloudflare wildcard)
+
+This section assumes you already have:
+
+- A wildcard `*.henryhomelab.dev` DNS record at Cloudflare (proxied or DNS-only, either works).
+- A **Caddy reverse proxy VM** elsewhere on the Proxmox host, already terminating TLS for your other services on `*.henryhomelab.dev`.
+
+Because you have a wildcard, **you do not need to add a new DNS record**. `claudeclaw.henryhomelab.dev` already resolves. All the work is:
+
+1. Tell the ClaudeClaw VM to trust the Caddy VM through the firewall.
+2. Add a site block to Caddy.
+3. Tell ClaudeClaw what its public URL is so Telegram `/dashboard` links use it.
+
+### Step 1: Find the IPs you need
+
+On the ClaudeClaw VM:
+
+```bash
+ip -4 addr show | grep inet
+```
+
+Note its LAN IP (e.g. `192.168.1.42`). Do the same on the Caddy VM (e.g. `192.168.1.10`). The rest of this section uses those placeholders.
+
+### Step 2: Open the firewall to the Caddy VM only
+
+Back in the hardening section you set ufw to `default deny incoming` and only allowed `tailscale0`. Caddy isn't on the tailnet, so you need to poke a single, scoped hole:
+
+```bash
+# On the ClaudeClaw VM
+sudo ufw allow from 192.168.1.10 to any port 3141 proto tcp comment 'caddy reverse proxy'
+sudo ufw status verbose
+```
+
+Use the Caddy VM's IP, not the whole subnet. Only that one host needs to reach port 3141.
+
+### Step 3: Add the site block to the Caddyfile
+
+SSH into the Caddy VM and edit `/etc/caddy/Caddyfile`:
+
+```caddy
+claudeclaw.henryhomelab.dev {
+    encode zstd gzip
+
+    # The dashboard talks SSE (live chat streaming) and WebSockets
+    # (/ws/warroom). Caddy handles both with no extra config, but do
+    # not add any buffering directives in front of this block.
+    reverse_proxy 192.168.1.42:3141 {
+        # Pass the original host + client IP through so the dashboard
+        # logs the right address instead of always seeing the Caddy VM.
+        header_up Host {host}
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+
+        # Reasonable timeouts. SSE streams are long lived.
+        transport http {
+            read_timeout 600s
+            write_timeout 600s
+        }
+    }
+}
+```
+
+Validate and reload:
+
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+If your Cloudflare record is **proxied (orange cloud)**, set your SSL mode in Cloudflare to **Full (strict)** and use Caddy's automatic HTTPS as above. Caddy will grab a real Let's Encrypt cert via HTTP-01, and Cloudflare will re-encrypt on the edge. If you hit HTTP-01 challenge issues because of the proxy, either switch the record to DNS-only during issuance or configure Caddy's [Cloudflare DNS plugin](https://github.com/caddy-dns/cloudflare) for DNS-01 and use a scoped Cloudflare API token.
+
+### Step 4: Tell ClaudeClaw its public URL
+
+On the ClaudeClaw VM, edit `~/claudeclaw-os/.env` and set:
+
+```
+DASHBOARD_URL=https://claudeclaw.henryhomelab.dev
+```
+
+Restart the service so the bot picks it up:
+
+```bash
+systemctl --user restart claudeclaw
+```
+
+Now when you send `/dashboard` in Telegram, the link comes back as `https://claudeclaw.henryhomelab.dev/?token=...&chatId=...` instead of a raw IP.
+
+### Step 5: Test it
+
+From anywhere on the internet:
+
+```bash
+curl -sI https://claudeclaw.henryhomelab.dev | head -5
+```
+
+You should see `HTTP/2 200` (or 401 if you hit `/` without a token, which is also fine — it means TLS, Caddy, and the upstream are all working). Then open the URL from `/dashboard` in Telegram on your phone. Live chat, SSE streaming, and the War Room WebSocket should all work.
+
+### Step 6 (recommended): Add Cloudflare Access in front of it
+
+The dashboard's own auth is just `?token=...` in the query string. That's fine, but URLs with tokens end up in browser history, clipboard managers, and server logs. Since you're already on Cloudflare, put Zero Trust Access in front of the hostname and require a real login before anyone reaches Caddy at all:
+
+1. Go to [one.dash.cloudflare.com](https://one.dash.cloudflare.com) → **Access** → **Applications** → **Add an application** → **Self-hosted**.
+2. Application domain: `claudeclaw.henryhomelab.dev`.
+3. Identity: Google, GitHub, or one-time PIN to your email.
+4. Policy: allow only your email address.
+
+Now every request to `claudeclaw.henryhomelab.dev` hits a Cloudflare login first. The `DASHBOARD_TOKEN` in the URL becomes a second factor rather than the only gate. Bonus: Cloudflare Access gives you an audit log of every time the dashboard was opened.
+
+If you do this, also set the Caddy block to only accept connections from Cloudflare's IP ranges so nobody can bypass Access by hitting Caddy directly over its IP. The maintained list is at [cloudflare.com/ips](https://www.cloudflare.com/ips/); add them as `remote_ip` matchers on the site block, or firewall them at the router.
+
+### Step 7: You can now turn off the LAN SSH fallback
+
+Earlier in the hardening section you left a `sudo ufw allow from 192.168.0.0/16 to any port 22 proto tcp` rule as a safety net. If Tailscale SSH has been working for a while and the dashboard is now reachable publicly, you don't need that fallback anymore:
+
+```bash
+sudo ufw status numbered
+sudo ufw delete <rule-number-for-port-22>
+```
+
+---
